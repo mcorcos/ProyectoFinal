@@ -25,6 +25,7 @@
 #include <stdbool.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* USER CODE END Includes */
@@ -55,8 +56,8 @@ extern TIM_HandleTypeDef htim1;  // PWM H-Bridge    - TIM1 CH1/CH1N
 #define BUTTON_Pin          GPIO_PIN_13
 
 // Velocidad de homing (Hz de STEP)
-#define FSTEP_HOME_HZ      300.0f   // ajustable: más lento = más suave para buscar HOME
-#define FSTEP_RUN_HZ	800.0f
+#define FSTEP_HOME_HZ      400.0f   // ajustable: más lento = más suave para buscar HOME
+#define FSTEP_RUN_HZ	250.0f
 // ---------- CLOCK CACHE ----------
 static uint32_t TIM2_Clk_Hz = 0;
 static uint32_t TIM1_Clk_Hz = 0;
@@ -74,6 +75,8 @@ typedef struct {
   float    spool_diameter_mm;   // diámetro efectivo del carrete
   float    dc_target_rpm;       // “velocidad” deseada del carrete (dummy)
   float    hbridge_duty_0_to_1; // duty del PWM del H-bridge (dummy directo)
+  // Objetivo de bobinado
+  float    target_turns_total;  // vueltas objetivo de la bobina (0 = infinito / solo rebote)
   // Límites
   float    fstep_min_hz;
   float    fstep_max_hz;
@@ -86,6 +89,11 @@ typedef struct {
 // Estado runtime
 static volatile uint8_t g_step_dir = 0;     // 0/1
 static float            g_step_freq_hz = 0; // monitoreo
+#if defined(__GNUC__)
+#define UNUSED_FUNC __attribute__((unused))
+#else
+#define UNUSED_FUNC
+#endif
 
 
 
@@ -110,12 +118,13 @@ UART_HandleTypeDef huart2;
 static BobbinConfig cfg = {
     .steps_per_rev       = 200,
     .microstepping       = 16,
-    .leadscrew_pitch_mm  = 2.0f,
+    .leadscrew_pitch_mm  = 8.0f,
     .traverse_width_mm   = 50.0f,
-    .wire_diameter_mm    = 0.3f,
-    .spool_diameter_mm   = 30.0f,
-    .dc_target_rpm       = 300.0f,
-    .hbridge_duty_0_to_1 = 0.5f,
+    .wire_diameter_mm    = 0.06f,
+    .spool_diameter_mm   = 32.0f,
+    .dc_target_rpm       = 155.0f,
+    .hbridge_duty_0_to_1 = 0.6f,
+    .target_turns_total  = 0.0f,  // 0 = no limitar por vueltas (usa solo rebote)
     .fstep_min_hz        = 50.0f,
     .fstep_max_hz        = 5000.0f,
     .traverse_passes_target = 0, // 0 = sin límite, rebota indefinidamente
@@ -130,6 +139,8 @@ static uint8_t s_backoff_done = 0;   // 0 = falta hacer el medio cm, 1 = ya hech
 static uint32_t g_traverse_passes_done = 0; // cuántas veces tocamos un extremo
 static uint8_t  g_run_dir = 1;              // 1 = alejándose de HOME, 0 = yendo a HOME
 static int32_t  g_limit_clear_steps = 0;    // margen en pasos para rearmar detección de límite
+static uint8_t  g_homed_done = 0;           // 0 = aún no homingueó en esta sesión
+static uint8_t  g_run_requested = 0;        // 1 = usuario pidió ciclo completo
 
 
 // ---------- ESTADOS DE LA MÁQUINA ----------
@@ -140,6 +151,7 @@ typedef enum {
 } MachineState_t;
 
 static volatile MachineState_t g_state = STATE_HOMING;
+static void SetState(MachineState_t new_state, const char *reason);
 
 typedef enum {
   LIMIT_NONE = 0,
@@ -176,12 +188,22 @@ static void DC_StartForward(float duty);
 static void DC_StartReverse(float duty);
 static void DC_Brake(void);
 static void DC_Coast(void);
+static void Console_PrintInfo(void);
 
 // Helpers demo
 static float    Compute_Stepper_Freq_From_DC(const BobbinConfig *c);
 static uint8_t  Button_Read(void);
+static inline uint8_t HomeSensor_IsActive(void);
+static void     Config_RecomputeDerived(void);
+static void     Console_PrintBanner(void);
+static void     PrintScaled(const char *label, float v, uint8_t decimals);
 
-//codigos
+// Consola UART simple
+static void     Console_Poll(void);
+static void     Console_ProcessLine(char *line);
+static void     Console_PrintHelp(void);
+static void     Console_PrintConfig(void);
+static void     Console_PrintStatus(void);
 
 static void Machine_Task(void);
 
@@ -193,7 +215,7 @@ static void Machine_Task(void);
 
 static void debug_printf(const char *fmt, ...)
 {
-    char buf[128];
+    char buf[192]; // un poco más grande para logs con varios campos
     va_list args;
     va_start(args, fmt);
     vsnprintf(buf, sizeof(buf), fmt, args);
@@ -202,11 +224,287 @@ static void debug_printf(const char *fmt, ...)
     HAL_UART_Transmit(&huart2, (uint8_t*)buf, strlen(buf), 20);
 }
 
+static void Console_PrintBanner(void)
+{
+  debug_printf("\r\n===============================\r\n");
+  debug_printf(" Bobinador v1 (UART @115200)\r\n");
+  debug_printf(" Comandos: HELP, CFG?, STAT?,\r\n");
+  debug_printf("   WIRE x, TURNS x, RPM x, DUTY x,\r\n");
+  debug_printf("   RUN, STOP, HOME\r\n");
+  debug_printf(" Boton B1 o RUN: HOMING -> backoff -> bobinado\r\n");
+  debug_printf("===============================\r\n\r\n");
+}
+
+static void PrintScaled(const char *label, float v, uint8_t decimals)
+{
+  static const int32_t pow10[] = {1, 10, 100, 1000, 10000};
+  if (decimals > 4) decimals = 4;
+  int32_t scale = pow10[decimals];
+  int32_t scaled = (int32_t)lroundf(v * (float)scale);
+  int32_t abs_scaled = (scaled < 0) ? -scaled : scaled;
+  debug_printf("%s%ld.%0*d\r\n", label, scaled / scale, decimals, abs_scaled % scale);
+}
+
+static const char* StateName(MachineState_t s)
+{
+  switch (s) {
+    case STATE_HOMING:  return "HOMING";
+    case STATE_IDLE:    return "IDLE";
+    case STATE_RUNNING: return "RUNNING";
+    default:            return "?";
+  }
+}
+static void SetState(MachineState_t new_state, const char *reason)
+{
+  MachineState_t old = g_state;
+  if (old == new_state) return;
+  g_state = new_state;
+  if (reason) {
+    debug_printf("[STATE] %s -> %s (%s)\r\n", StateName(old), StateName(new_state), reason);
+  } else {
+    debug_printf("[STATE] %s -> %s\r\n", StateName(old), StateName(new_state));
+  }
+}
+
+
+// ======================== CONSOLA UART BÁSICA ========================
+
+#define CONSOLE_RX_BUF_LEN  64
+#define CONSOLE_ECHO        1
+static char   s_console_buf[CONSOLE_RX_BUF_LEN];
+static uint8_t s_console_idx = 0;
+
+static void Console_Poll(void)
+{
+  uint8_t ch;
+  if (HAL_UART_Receive(&huart2, &ch, 1, 0) == HAL_OK)
+  {
+    if (CONSOLE_ECHO)
+    {
+      if (ch == '\r' || ch == '\n') {
+        const char crlf[] = "\r\n";
+        HAL_UART_Transmit(&huart2, (uint8_t*)crlf, 2, 10);
+      } else {
+        HAL_UART_Transmit(&huart2, &ch, 1, 10);
+      }
+    }
+
+    if (ch == '\r' || ch == '\n')
+    {
+      if (s_console_idx > 0)
+      {
+        s_console_buf[s_console_idx] = '\0';
+        Console_ProcessLine(s_console_buf);
+        s_console_idx = 0;
+      }
+    }
+    else
+    {
+      if (s_console_idx < (CONSOLE_RX_BUF_LEN - 1))
+      {
+        s_console_buf[s_console_idx++] = (char)ch;
+      }
+    }
+  }
+}
+
+static void Console_StrToUpper(char *s)
+{
+  while (*s)
+  {
+    if (*s >= 'a' && *s <= 'z') *s = (char)(*s - 'a' + 'A');
+    s++;
+  }
+}
+
+static int Console_ParseFloat(const char *p, float *out)
+{
+  while (*p == ' ' || *p == '\t' || *p == '=') p++;
+  char *endp = NULL;
+  float v = strtof(p, &endp);
+  if (endp == p) return 0;
+  *out = v;
+  return 1;
+}
+
+static void Console_ProcessLine(char *line)
+{
+  // Hacemos una copia para comandos en mayúsculas
+  char cmd[CONSOLE_RX_BUF_LEN];
+  strncpy(cmd, line, sizeof(cmd) - 1);
+  cmd[sizeof(cmd) - 1] = '\0';
+
+  // Quitar espacios iniciales
+  char *p = cmd;
+  while (*p == ' ' || *p == '\t') p++;
+
+  Console_StrToUpper(p);
+
+  if (strcmp(p, "HELP") == 0)
+  {
+    Console_PrintHelp();
+  }
+  else if (strcmp(p, "CFG?") == 0)
+  {
+    Console_PrintConfig();
+  }
+  else if (strcmp(p, "INFO?") == 0)
+  {
+    Console_PrintInfo();
+  }
+  else if (strcmp(p, "STAT?") == 0)
+  {
+    Console_PrintStatus();
+  }
+  else if (strncmp(p, "WIRE", 4) == 0)
+  {
+    float v;
+    if (Console_ParseFloat(p + 4, &v))
+    {
+      if (v > 0.0f)
+      {
+        cfg.wire_diameter_mm = v;
+        debug_printf("[CFG] wire_diameter_mm=%.3f\r\n", cfg.wire_diameter_mm);
+        Config_RecomputeDerived();
+      }
+    }
+  }
+  else if (strncmp(p, "TURNS", 5) == 0)
+  {
+    float v;
+    if (Console_ParseFloat(p + 5, &v))
+    {
+      if (v < 0.0f) v = 0.0f;
+      cfg.target_turns_total = v;
+      debug_printf("[CFG] target_turns_total=%.1f\r\n", cfg.target_turns_total);
+      Config_RecomputeDerived();
+    }
+  }
+  else if (strncmp(p, "RPM", 3) == 0)
+  {
+    float v;
+    if (Console_ParseFloat(p + 3, &v))
+    {
+      if (v < 0.0f) v = 0.0f;
+      cfg.dc_target_rpm = v;
+      debug_printf("[CFG] dc_target_rpm=%.1f\r\n", cfg.dc_target_rpm);
+    }
+  }
+  else if (strncmp(p, "DUTY", 4) == 0)
+  {
+    float v;
+    if (Console_ParseFloat(p + 4, &v))
+    {
+      if (v < 0.0f) v = 0.0f;
+      if (v > 1.0f) v = 1.0f;
+      cfg.hbridge_duty_0_to_1 = v;
+      debug_printf("[CFG] hbridge_duty=%.2f\r\n", cfg.hbridge_duty_0_to_1);
+    }
+  }
+  else if (strcmp(p, "RUN") == 0)
+  {
+    g_run_requested = 1;
+    debug_printf("[CMD] RUN request\r\n");
+  }
+  else if (strcmp(p, "STOP") == 0)
+  {
+    Steppers_SetStepFreq_Hz(0.0f);
+    DC_Brake();
+    g_run_requested = 0;
+    g_homed_done = HomeSensor_IsActive() ? 1 : g_homed_done;
+    SetState(STATE_IDLE, "STOP");
+    debug_printf("[CMD] STOP -> IDLE\r\n");
+  }
+  else if (strcmp(p, "HOME") == 0)
+  {
+    s_backoff_done = 0;
+    g_homed_done = 0;
+    SetState(STATE_HOMING, "cmd HOME");
+    debug_printf("[CMD] HOME -> STATE_HOMING\r\n");
+  }
+  else
+  {
+    debug_printf("[CMD] Desconocido. Usa HELP\r\n");
+  }
+}
+
+static void Console_PrintHelp(void)
+{
+  debug_printf("\r\nComandos UART:\r\n");
+  debug_printf("  HELP          : esta ayuda\r\n");
+  debug_printf("  CFG?          : mostrar configuracion actual\r\n");
+  debug_printf("  INFO?         : resumen derivado (vueltas capa, pasos/mm, fstep)\r\n");
+  debug_printf("  STAT?         : estado y posicion\r\n");
+  debug_printf("  WIRE x        : diametro hilo (mm)\r\n");
+  debug_printf("  TURNS x       : vueltas objetivo totales (0=infinito)\r\n");
+  debug_printf("  RPM x         : rpm objetivo carrete\r\n");
+  debug_printf("  DUTY x        : duty DC [0..1]\r\n");
+  debug_printf("  RUN           : iniciar bobinado (desde IDLE)\r\n");
+  debug_printf("  STOP          : frenar y pasar a IDLE\r\n");
+  debug_printf("  HOME          : volver a hacer homing\r\n\r\n");
+}
+
+static void Console_PrintConfig(void)
+{
+  debug_printf("CFG: steps=%u micro=%u pitch=%.3fmm width=%.1fmm\r\n",
+               cfg.steps_per_rev, cfg.microstepping,
+               cfg.leadscrew_pitch_mm, cfg.traverse_width_mm);
+  debug_printf("CFG: wire=%.3fmm target_turns=%.1f\r\n",
+               cfg.wire_diameter_mm, cfg.target_turns_total);
+  debug_printf("CFG: dc_rpm=%.1f duty=%.2f\r\n",
+               cfg.dc_target_rpm, cfg.hbridge_duty_0_to_1);
+  debug_printf("CFG: fstep[min,max]=[%.1f, %.1f]Hz passes_target=%lu\r\n",
+               cfg.fstep_min_hz, cfg.fstep_max_hz,
+               (unsigned long)cfg.traverse_passes_target);
+}
+
+static void Console_PrintStatus(void)
+{
+  debug_printf("STAT: state=%s pos=%ld dir=%u passes=%lu/%lu HOME=%u\r\n",
+               StateName(g_state), g_pos_steps, g_run_dir,
+               (unsigned long)g_traverse_passes_done,
+               (unsigned long)cfg.traverse_passes_target,
+               HomeSensor_IsActive());
+}
+
+static void Console_PrintInfo(void)
+{
+  float k_spmm = steps_per_mm(&cfg);
+  float turns_per_layer = (cfg.wire_diameter_mm > 0.0f) ? (cfg.traverse_width_mm / cfg.wire_diameter_mm) : 0.0f;
+  float fstep = Compute_Stepper_Freq_From_DC(&cfg);
+  debug_printf("INFO: steps/mm=%.1f turns/layer=%.1f target_turns=%.1f\r\n",
+               k_spmm, turns_per_layer, cfg.target_turns_total);
+  debug_printf("INFO: passes_target=%lu (0=inf) fstep_calc=%.1f Hz\r\n",
+               (unsigned long)cfg.traverse_passes_target, fstep);
+}
 
 
 
 static inline float steps_per_mm(const BobbinConfig *c) {
   return ((float)c->steps_per_rev * (float)c->microstepping) / c->leadscrew_pitch_mm;
+}
+
+// Recalcula valores derivados de cfg (pasadas objetivo y márgenes de límite)
+static void Config_RecomputeDerived(void)
+{
+  float k_steps_per_mm = steps_per_mm(&cfg);
+  g_limit_clear_steps = (int32_t)lroundf(LIMIT_CLEAR_MM * k_steps_per_mm);
+  if (g_limit_clear_steps < 1) g_limit_clear_steps = 1;
+
+  if (cfg.target_turns_total > 0.0f &&
+      cfg.traverse_width_mm > 0.0f &&
+      cfg.wire_diameter_mm > 0.0f)
+  {
+    float turns_per_layer = cfg.traverse_width_mm / cfg.wire_diameter_mm; // vueltas por capa
+    float layers = cfg.target_turns_total / turns_per_layer;             // capas necesarias
+    float passes_f = layers * 2.0f;                                      // 2 extremos por capa
+    if (passes_f < 1.0f) passes_f = 1.0f;
+    cfg.traverse_passes_target = (uint32_t)lroundf(passes_f);
+  }
+  else
+  {
+    cfg.traverse_passes_target = 0; // rebote infinito si no hay objetivo de vueltas
+  }
 }
 
 
@@ -484,16 +782,20 @@ int main(void)
   g_pos_steps = 0;                // después de HOME, este será nuestro origen
   g_traverse_passes_done = 0;
   g_run_dir = 1;                  // alejándose de HOME (positivo)
-  g_limit_clear_steps = (int32_t)lroundf(LIMIT_CLEAR_MM * k_steps_per_mm);
-  if (g_limit_clear_steps < 1) g_limit_clear_steps = 1;
   g_last_limit_hit = LIMIT_NONE;
+  Config_RecomputeDerived();
 
   // Habilitar interrupción de actualización de TIM2 para contar pasos
   __HAL_TIM_CLEAR_FLAG(&htim2, TIM_FLAG_UPDATE);
   __HAL_TIM_ENABLE_IT(&htim2, TIM_IT_UPDATE);
 
   // Estado inicial de la máquina: arrancamos haciendo HOMING
-  g_state = STATE_HOMING;
+  g_state = STATE_IDLE; // esperamos botón para iniciar homing
+  g_homed_done = 0;
+  g_run_requested = 0;
+
+  Console_PrintBanner();
+  debug_printf("[STATE] BOOT -> IDLE (espera RUN/B1)\r\n");
 
 
 
@@ -518,14 +820,17 @@ int main(void)
     /* USER CODE BEGIN 3 */
 
 
-	// Máquina de estados principal:
-	// - STATE_HOMING: buscar sensor HOME y fijar origen
-	// - STATE_IDLE: quieto esperando orden
-	// - STATE_RUNNING: (lo llenamos después con el programa de bobinado)
-	Machine_Task();
+// Máquina de estados principal:
+// - STATE_HOMING: buscar sensor HOME y fijar origen (se activa al inicio o por botón si no se homingueó)
+// - STATE_IDLE: quieto esperando orden
+// - STATE_RUNNING: programa de bobinado
+    Machine_Task();
 
-	// Pequeño delay para no saturar la CPU ni el bus
-	HAL_Delay(10);
+    // Consola UART no bloqueante
+    Console_Poll();
+
+    // Pequeño delay para no saturar la CPU ni el bus
+    HAL_Delay(10);
 
   }
   /* USER CODE END 3 */
@@ -811,13 +1116,9 @@ static void Machine_Task(void)
   case STATE_HOMING:
 
 
-    debug_printf("[HOMING] HOME=%d pos=%ld\r\n",
-                   HomeSensor_IsActive(),
-                   g_pos_steps);
-
 	// 1) Asegurar dirección hacia el sensor HOME
     //    Elegí el sentido correcto según cómo esté montado.
-    Steppers_SetDir(0);                         // 0 o 1, el que vaya "hacia HOME"
+    Steppers_SetDir(1);                         // 1 va a home , 0 va a afuera
 
     // 2) Asegurar que el stepper esté moviéndose a velocidad de homing
     Steppers_SetStepFreq_Hz(FSTEP_HOME_HZ);
@@ -830,13 +1131,14 @@ static void Machine_Task(void)
       g_pos_steps = 0;
       g_min_steps = 0;      // podés redefinir límites acá si querés
       // g_max_steps ya lo calculaste antes con traverse_width_mm
+      g_homed_done = 1;
+      s_backoff_done = 0;   // después del homing haremos el retroceso de 5 mm
 
       // Más adelante acá podés hacer un backoff (retroceder unos pasos)
       // si necesitás separar del sensor físico.
 
       debug_printf("[HOMING] Detectado HOME. pos=0\r\n");
-	  g_state = STATE_IDLE;
-	  debug_printf(">> Cambio de estado: IDLE\r\n");
+	  SetState(STATE_IDLE, "homing completado");
 
 
     }
@@ -845,62 +1147,56 @@ static void Machine_Task(void)
   case STATE_IDLE:
   {
 
-    debug_printf("[IDLE] pos=%ld backoff=%d HOME=%d\r\n",
-                   g_pos_steps, s_backoff_done, HomeSensor_IsActive());
-
-    // 1) Si todavía NO hicimos el backoff de 0,5 cm desde HOME, lo hacemos acá
-    if (!s_backoff_done)
+    // Botón START siempre marca el pedido de ciclo
+    if (Button_Read())
     {
-      // Dirección opuesta a HOME (alejarse del sensor)
-      Steppers_SetDir(1);    // si ves que va al lado equivocado, cambiá a 0
+      g_run_requested = 1;
+      debug_printf("[IDLE] START recibido\r\n");
+    }
 
-      // Velocidad suave para posicionamiento
-      Steppers_SetStepFreq_Hz(FSTEP_HOME_HZ);
+    // Si no hay pedido de ciclo, quieto
+    Steppers_SetStepFreq_Hz(0.0f);
+    if (!g_run_requested) break;
 
-      // Cuántos pasos equivalen a 0,5 cm = 5 mm
-      float k_spmm = steps_per_mm(&cfg);
-      int32_t target_steps = (int32_t)lroundf(5.0f * k_spmm);
+    // Si el sensor está activo, damos por homing hecho
+    if (HomeSensor_IsActive()) {
+      g_homed_done = 1;
+      g_pos_steps = 0;
+    }
 
-      // g_pos_steps lo está actualizando la IRQ de TIM2 según la dirección
-      if (g_pos_steps >= target_steps)
-      {
-        // Ya recorrimos el medio centímetro → frenar y marcar como hecho
-        Steppers_SetStepFreq_Hz(0.0f);
-        s_backoff_done = 1;
-        debug_printf("[IDLE] Backoff DONE pos=%ld\r\n", g_pos_steps);
-      }
-
-      // Seguimos en STATE_IDLE hasta completar el backoff
+    // 1) Si todavía NO se hizo homing en esta sesión, ir a HOMING
+    if (!g_homed_done)
+    {
+      SetState(STATE_HOMING, "pedido de ciclo");
       break;
     }
 
-    // 2) Backoff ya hecho → quieto, esperando START
+
+
+    // 3) Todo listo → arrancar RUNNING automáticamente
     Steppers_SetStepFreq_Hz(0.0f);
+    float f = Compute_Stepper_Freq_From_DC(&cfg);
 
-    if (Button_Read())
-    {
-      // Botón START apretado → calcular frecuencia ideal desde los datos del bobinado
-      float f = Compute_Stepper_Freq_From_DC(&cfg);
+    // Reset de contadores de pasada y banderas de límites
+    g_traverse_passes_done = 0;
+    g_last_limit_hit = LIMIT_NONE;
 
-      // Reset de contadores de pasada y banderas de límites
-      g_traverse_passes_done = 0;
-      g_last_limit_hit = LIMIT_NONE;
+    // Nos aseguramos de ir alejándonos de HOME
+    g_run_dir = 0;
+    Steppers_SetDir(g_run_dir);        // mismo comentario, invertí si hace falta
+    Steppers_SetStepFreq_Hz(f);
 
-      // Nos aseguramos de ir alejándonos de HOME
-      g_run_dir = 1;
-      Steppers_SetDir(g_run_dir);        // mismo comentario, invertí si hace falta
-      Steppers_SetStepFreq_Hz(f);
+    debug_printf("[IDLE] RUN request -> RUNNING\r\n");
 
-      debug_printf("[IDLE] START detectado -> RUNNING\r\n");
-
-      g_state = STATE_RUNNING;
-      debug_printf(">> Cambio de estado: RUNNING\r\n");
-    }
+    SetState(STATE_RUNNING, "arranque de ciclo");
     break;
   }
 
   case STATE_RUNNING:
   {
+
+    // Log periódico de avance: posición actual y distancia al próximo rebote
+    static uint32_t s_last_run_log_ms = 0;
 
     DC_StartForward(cfg.hbridge_duty_0_to_1);
 
@@ -917,11 +1213,11 @@ static void Machine_Task(void)
     uint8_t next_dir = g_run_dir;
     if (g_pos_steps >= g_max_steps) {
       hit = LIMIT_MAX;
-      next_dir = 0;                 // volver hacia HOME
+      next_dir = 1;                 //  1 va a home. volver hacia HOME
       g_pos_steps = g_max_steps;    // clamp
     } else if (g_pos_steps <= g_min_steps) {
       hit = LIMIT_MIN;
-      next_dir = 1;                 // alejarse de HOME
+      next_dir = 0;                 // 0 se aleja de home .alejarse de HOME
       g_pos_steps = g_min_steps;    // clamp
     }
 
@@ -931,9 +1227,10 @@ static void Machine_Task(void)
       g_run_dir = next_dir;
 
       // Pequeña pausa para amortiguar el rebote mecánico
-      Steppers_SetStepFreq_Hz(0.0f);
+     // Steppers_SetStepFreq_Hz(FSTEP_RUN_HZ);
       HAL_Delay(BOUNCE_DWELL_MS);
 
+      // Log rebote una sola vez por evento de límite
       debug_printf("[RUNNING] Limite %s -> rebote dir=%u, pasada=%lu\r\n",
                    (hit == LIMIT_MAX) ? "MAX" : "MIN",
                    g_run_dir,
@@ -943,8 +1240,11 @@ static void Machine_Task(void)
           g_traverse_passes_done >= cfg.traverse_passes_target) {
         Steppers_SetStepFreq_Hz(0.0f);
         DC_Brake();
-        g_state = STATE_IDLE;
-        debug_printf(">> Run completo (%lu pasadas). Estado: IDLE\r\n",
+        g_run_requested = 0;
+        g_homed_done = 0;     // queremos volver a homing
+        s_backoff_done = 0;
+        SetState(STATE_HOMING, "RUN completo -> volver a HOME");
+        debug_printf(">> Run completo (%lu pasadas). Estado: HOMING\r\n",
                      (unsigned long)g_traverse_passes_done);
         break;
       }
@@ -959,12 +1259,37 @@ static void Machine_Task(void)
     // Aplicar frecuencia calculada
     Steppers_SetStepFreq_Hz(f);
 
+    // Telemetría: cuánto nos movimos y cuánto falta para rebotar
+    uint32_t now_ms = HAL_GetTick();
+    if (now_ms - s_last_run_log_ms >= 200) { // ~5 Hz para no saturar UART
+      s_last_run_log_ms = now_ms;
+      float k_spmm = steps_per_mm(&cfg);
+      if (k_spmm < 1e-6f) k_spmm = 1.0f; // evitar div por cero si config inválida
 
-    debug_printf("[RUNNING] pos=%ld dir=%u pasa=%lu/%lu fstep=%.1f\r\n",
-                 g_pos_steps, g_run_dir,
-                 (unsigned long)g_traverse_passes_done,
-                 (unsigned long)cfg.traverse_passes_target,
-                 f);
+      // Copias locales para evitar inconsistencias mientras se actualizan en la ISR
+      int32_t pos_steps = g_pos_steps;
+      int32_t min_steps = g_min_steps;
+      int32_t max_steps = g_max_steps;
+
+      // Escalado x10 para imprimir con enteros (evita %f en printf)
+      int32_t pos_mm10         = (int32_t)lroundf(((float)pos_steps / k_spmm) * 10.0f);
+      int32_t dist_to_min_mm10 = (int32_t)lroundf(((float)(pos_steps - min_steps) / k_spmm) * 10.0f);
+      if (dist_to_min_mm10 < 0) dist_to_min_mm10 = 0;
+      int32_t dist_to_max_mm10 = (int32_t)lroundf(((float)(max_steps - pos_steps) / k_spmm) * 10.0f);
+      if (dist_to_max_mm10 < 0) dist_to_max_mm10 = 0;
+      int32_t dist_to_next_mm10 = g_run_dir ? dist_to_min_mm10 : dist_to_max_mm10;
+      int32_t f_hz10 = (int32_t)lroundf(f * 10.0f);
+
+      debug_printf("[RUNNING] pos=%ld.%01ldmm dir=%u f=%ld.%01ldHz -> faltan %ld.%01ldmm al rebote (min=%ld.%01ld, max=%ld.%01ld) steps=%ld\r\n",
+                   (long)(pos_mm10 / 10), (long)(labs(pos_mm10) % 10),
+                   g_run_dir,
+                   (long)(f_hz10 / 10), (long)(labs(f_hz10) % 10),
+                   (long)(dist_to_next_mm10 / 10), (long)(labs(dist_to_next_mm10) % 10),
+                   (long)(dist_to_min_mm10 / 10), (long)(labs(dist_to_min_mm10) % 10),
+                   (long)(dist_to_max_mm10 / 10), (long)(labs(dist_to_max_mm10) % 10),
+                   (long)pos_steps);
+    }
+
     break;
   }
 
@@ -979,11 +1304,15 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance == TIM2)
   {
+    // Si el stepper está parado, no contamos posición (evita drift por PWM del DC)
+    if (g_step_freq_hz <= 0.0f) return;
+
     // Siempre actualizamos la posición del carro
+    // g_step_dir = 1 significa que vamos hacia HOME (decrementa pos)
     if (g_step_dir)
-      g_pos_steps++;
-    else
       g_pos_steps--;
+    else
+      g_pos_steps++;
   }
 }
 

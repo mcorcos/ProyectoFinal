@@ -1,44 +1,77 @@
 # ProyectoFinal – Control de bobinadora (STM32F303RE)
 
-Descripción corta: firmware generado en CubeIDE que controla un eje con STEP/DIR (DM542) y un motor DC con puente H (L298). Incluye homing con sensor inductivo, backoff, rebote en extremos virtuales y conteo de pasadas configurables.
+Firmware CubeIDE para un eje STEP/DIR (DM542) y un motor DC con puente H (L298). Incluye homing con sensor inductivo, backoff, rebote con pasadas contadas y logs por UART.
 
-## Diagrama rápido de estados
-- HOMING: avanza hacia HOME a `FSTEP_HOME_HZ` hasta que el sensor (activo en bajo) se activa; fija pos=0.
+## Índice
+- [Estados](#estados)
+- [Pines](#pines)
+- [Timers](#timers)
+- [Configuración rápida](#configuración-rápida)
+- [Flujo de uso](#flujo-de-uso)
+- [Logs UART](#logs-uart)
+- [Build/flash](#buildflash)
+- [Advertencias / TODO](#advertencias--todo)
+
+## Estados
+```
+HOMING  --(sensor HOME activo)-->  IDLE --(B1 pulsado)--> RUNNING
+   ^                                 ^                        |
+   |---------------------------------|<------- rebote --------|
+```
+- HOMING: avanza hacia HOME a `FSTEP_HOME_HZ` hasta que el sensor (activo en bajo) se activa; fija `pos=0`.
 - IDLE: hace un backoff de 5 mm alejándose de HOME, queda detenido y espera botón B1 (PC13 a 0).
-- RUNNING: mueve el carro según la frecuencia calculada por `Compute_Stepper_Freq_From_DC` y rebota en `g_min_steps/g_max_steps`. Cuenta pasadas y vuelve a IDLE al alcanzar `cfg.traverse_passes_target` (>0) o rebota infinito si es 0.
+- RUNNING: mueve el carro con la frecuencia de `Compute_Stepper_Freq_From_DC`, rebota en `g_min_steps/g_max_steps`, cuenta pasadas y vuelve a IDLE al alcanzar `cfg.traverse_passes_target` (>0) o sigue infinito si es 0.
 
-## Pines relevantes (ver `Core/Inc/main.h`)
-- Stepper DM542: DIR `PA1`, EN `PA4`, STEP `PA0` (TIM2_CH1).
-- Sensor HOME: `PB5`, activo en 0.
-- Botón placa (START): `PC13` (Nucleo B1, activo en 0).
-- L298: IN1 `PB10`, IN2 `PB11`, ENA `PA8` (TIM1_CH1 en el cubo). **Nota:** el PWM actual del código sale por TIM2_CH3 `PA9` (ver sección Timers).
+## Pines
+| Función            | MCU pin | Notas                            |
+|--------------------|---------|----------------------------------|
+| STEP DM542         | PA0     | TIM2_CH1                         |
+| DIR DM542          | PA1     | GPIO                             |
+| EN DM542           | PA4     | GPIO                             |
+| HOME sensor        | PB5     | Activo en 0                      |
+| Botón START (B1)   | PC13    | Activo en 0                      |
+| L298 IN1 / IN2     | PB10/11 | GPIO                             |
+| L298 ENA           | PA8     | TIM1_CH1 en pines del cubo       |
+| PWM DC efectivo    | PA9     | **TIM2_CH3 usado en el código**  |
 
-## Timers y PWM
-- TIM2_CH1: STEP del DM542 (cálculo dinámico de PSC/ARR/CCR en `Steppers_SetStepFreq_Hz`).
-- TIM2_CH3: PWM que hoy gobierna el L298 en el código (`DC_*`). Advertencia: al recalcular la frecuencia de STEP se reescribe PSC/ARR/CCR1 y afecta también al PWM del DC. TIM1 está inicializado y el pin ENA está en PA8/TIM1; mover el PWM del DC a TIM1 evitaría el acople.
+## Timers
+| Timer/Canal | Uso actual              | Comentario |
+|-------------|-------------------------|------------|
+| TIM2_CH1    | STEP DM542              | `Steppers_SetStepFreq_Hz` recalcula PSC/ARR/CCR1 |
+| TIM2_CH3    | PWM L298 (DC)           | Comparte PSC/ARR con CH1 → acople de RPM |
+| TIM1_CH1    | Inicializado, libre     | Pin PA8 (ENA) definido; mover PWM aquí aislaría el DC |
 
-## Configuración clave (`Core/Src/main.c`)
-Estructura `cfg` editable en build-time:
-- `steps_per_rev`, `microstepping`, `leadscrew_pitch_mm`, `traverse_width_mm`, `wire_diameter_mm`.
-- `dc_target_rpm`, `hbridge_duty_0_to_1`.
-- Límites de frecuencia: `fstep_min_hz`, `fstep_max_hz`.
-- `traverse_passes_target`: 0 = rebote infinito; >0 detiene tras esa cantidad de toques de extremo.
+## Configuración rápida (`Core/Src/main.c`)
+Estructura `cfg`:
+| Campo                   | Qué hace                                      |
+|-------------------------|-----------------------------------------------|
+| `steps_per_rev`         | Pasos enteros por vuelta del motor            |
+| `microstepping`         | Subdivisión del driver                        |
+| `leadscrew_pitch_mm`    | mm/vuelta del husillo                         |
+| `traverse_width_mm`     | Recorrido total virtual                       |
+| `wire_diameter_mm`      | Avance lateral por vuelta de carrete          |
+| `dc_target_rpm`         | RPM objetivo del carrete                      |
+| `hbridge_duty_0_to_1`   | Duty fijo para el DC                          |
+| `fstep_min_hz` / `max`  | Clampeo de frecuencia de STEP                 |
+| `traverse_passes_target`| 0 = rebote infinito; >0 detiene tras N toques |
 
-Constantes de movimiento:
-- `BOUNCE_DWELL_MS` (pausa al rebotar) y `LIMIT_CLEAR_MM` (histeresis de detección de límite).
-- `FSTEP_HOME_HZ` fija la velocidad de homing.
+Constantes:
+- `BOUNCE_DWELL_MS`: pausa al rebotar.
+- `LIMIT_CLEAR_MM`: histeresis de detección de límite.
+- `FSTEP_HOME_HZ`: velocidad de homing.
 
-## Cómo arranca
-1) `main()` inicializa clocks/GPIO/UART/TIM1/TIM2, calcula pasos/mm y límites virtuales, habilita interrupción de TIM2 para contar pasos.
-2) Arranca en HOMING con dirección hacia HOME y DC en forward al duty configurado.
-3) Tras HOME hace backoff de 5 mm, queda en IDLE y espera botón. RUNNING rebota y cuenta pasadas.
+## Flujo de uso
+1) Flash/Reset: arranca HOMING dirigiéndose al sensor HOME.
+2) Al activar HOME: fija `pos=0`, pasa a IDLE y ejecuta backoff de 5 mm alejándose del sensor.
+3) En IDLE: espera botón B1. Al pulsar: resetea pasadas, calcula frecuencia de STEP desde `cfg` y arranca RUNNING alejándose de HOME.
+4) RUNNING: rebota en límites, cuenta pasadas y frena en IDLE si `traverse_passes_target` > 0.
 
-## Logs por UART
-- USART2 a 115200 8N1. Mensajes tipo `[HOMING]`, `[IDLE]`, `[RUNNING]` con posición, dirección y pasadas.
+## Logs UART
+- USART2 115200 8N1. Mensajes: `[HOMING]`, `[IDLE]`, `[RUNNING] pos=... dir=... pasa=...`.
 
 ## Build/flash
-- Proyecto CubeIDE. Micro: STM32F303RE. Perfil FLASH en `STM32F303RETX_FLASH.ld`. Para depurar usa la launch `ProyectoFinal Debug.launch`.
+- Proyecto CubeIDE (STM32F303RE). Linker: `STM32F303RETX_FLASH.ld`. Launch: `ProyectoFinal Debug.launch`.
 
-## Advertencias abiertas
-- El acople por compartir TIM2 entre STEP y PWM del DC puede cambiar la velocidad del carrete cuando se ajusta la frecuencia de STEP. Considera migrar el PWM del DC a TIM1_CH1 (PA8) para aislarlo.
-- Revisar que las direcciones (`Steppers_SetDir`) coincidan con el montaje (HOME y avance).
+## Advertencias / TODO
+- El PWM del DC comparte TIM2 con el STEP: cambiar la frecuencia del stepper cambia PSC/ARR y puede alterar RPM del carrete. Migrar PWM a TIM1_CH1 (PA8) eliminaría el acople.
+- Verificar sentido de `Steppers_SetDir` según montaje (HOME y avance).

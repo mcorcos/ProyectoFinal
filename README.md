@@ -52,8 +52,9 @@ Estructura `cfg`:
 | `wire_diameter_mm`      | Avance lateral por vuelta de carrete          |
 | `dc_target_rpm`         | RPM objetivo del carrete                      |
 | `hbridge_duty_0_to_1`   | Duty fijo para el DC                          |
+| `target_turns_total`    | Vueltas objetivo de la bobina (0 = infinito)  |
 | `fstep_min_hz` / `max`  | Clampeo de frecuencia de STEP                 |
-| `traverse_passes_target`| 0 = rebote infinito; >0 detiene tras N toques |
+| `traverse_passes_target`| Valor derivado: pasadas calculadas desde vueltas/geom. |
 
 Constantes:
 - `BOUNCE_DWELL_MS`: pausa al rebotar.
@@ -64,7 +65,7 @@ Constantes:
 1) Flash/Reset: arranca HOMING dirigiéndose al sensor HOME.
 2) Al activar HOME: fija `pos=0`, pasa a IDLE y ejecuta backoff de 5 mm alejándose del sensor.
 3) En IDLE: espera botón B1. Al pulsar: resetea pasadas, calcula frecuencia de STEP desde `cfg` y arranca RUNNING alejándose de HOME.
-4) RUNNING: rebota en límites, cuenta pasadas y frena en IDLE si `traverse_passes_target` > 0.
+4) RUNNING: rebota en límites, cuenta pasadas y frena en IDLE si `target_turns_total > 0` (se convierte internamente a `traverse_passes_target`), o rebota infinito si es 0.
 
 ## Logs UART
 - USART2 115200 8N1. Mensajes: `[HOMING]`, `[IDLE]`, `[RUNNING] pos=... dir=... pasa=...`.

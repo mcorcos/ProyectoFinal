@@ -56,7 +56,7 @@ extern TIM_HandleTypeDef htim1;  // PWM H-Bridge    - TIM1 CH1/CH1N
 #define BUTTON_Pin          GPIO_PIN_13
 
 // Velocidad de homing (Hz de STEP)
-#define FSTEP_HOME_HZ      400.0f   // ajustable: más lento = más suave para buscar HOME
+#define FSTEP_HOME_HZ      200.0f   // ajustable: más lento = más suave para buscar HOME
 #define FSTEP_RUN_HZ	250.0f
 // ---------- CLOCK CACHE ----------
 static uint32_t TIM2_Clk_Hz = 0;
@@ -116,13 +116,14 @@ UART_HandleTypeDef huart2;
 
 // Config por defecto para probar
 static BobbinConfig cfg = {
-    .steps_per_rev       = 200,
-    .microstepping       = 16,
+    .steps_per_rev       = 400,
+    .microstepping       = 1,
+    // Medido en el banco: 1 vuelta del motor desplaza ~80 mm (correa HTD5 16T)
     .leadscrew_pitch_mm  = 8.0f,
     .traverse_width_mm   = 50.0f,
     .wire_diameter_mm    = 0.06f,
     .spool_diameter_mm   = 32.0f,
-    .dc_target_rpm       = 155.0f,
+    .dc_target_rpm       = 37.25f,
     .hbridge_duty_0_to_1 = 0.6f,
     .target_turns_total  = 0.0f,  // 0 = no limitar por vueltas (usa solo rebote)
     .fstep_min_hz        = 50.0f,
@@ -141,6 +142,7 @@ static uint8_t  g_run_dir = 1;              // 1 = alejándose de HOME, 0 = yend
 static int32_t  g_limit_clear_steps = 0;    // margen en pasos para rearmar detección de límite
 static uint8_t  g_homed_done = 0;           // 0 = aún no homingueó en esta sesión
 static uint8_t  g_run_requested = 0;        // 1 = usuario pidió ciclo completo
+static uint8_t  g_offset60_done = 0;        // 0 = aún no avanzó 60mm tras HOME
 
 
 // ---------- ESTADOS DE LA MÁQUINA ----------
@@ -412,6 +414,7 @@ static void Console_ProcessLine(char *line)
     DC_Brake();
     g_run_requested = 0;
     g_homed_done = HomeSensor_IsActive() ? 1 : g_homed_done;
+    g_offset60_done = 0;
     SetState(STATE_IDLE, "STOP");
     debug_printf("[CMD] STOP -> IDLE\r\n");
   }
@@ -1131,8 +1134,9 @@ static void Machine_Task(void)
       g_pos_steps = 0;
       g_min_steps = 0;      // podés redefinir límites acá si querés
       // g_max_steps ya lo calculaste antes con traverse_width_mm
-      g_homed_done = 1;
-      s_backoff_done = 0;   // después del homing haremos el retroceso de 5 mm
+	      g_homed_done = 1;
+	      s_backoff_done = 0;   // después del homing haremos el retroceso de 5 mm
+	      g_offset60_done = 0;  // todavía no hicimos el avance de 60mm
 
       // Más adelante acá podés hacer un backoff (retroceder unos pasos)
       // si necesitás separar del sensor físico.
@@ -1172,6 +1176,39 @@ static void Machine_Task(void)
     }
 
 
+    // 2) Tras HOMING, avanzar primero 60mm alejándonos de HOME antes de entrar a RUNNING
+    if (!g_offset60_done)
+    {
+      float k_spmm = steps_per_mm(&cfg);
+      int32_t target_steps = (int32_t)lroundf(60.0f * k_spmm); // 60mm desde HOME
+      // Evitar quedar justo en el límite para no rebotar al instante
+      int32_t max_target = g_max_steps - g_limit_clear_steps;
+      if (max_target < 0) max_target = 0;
+      if (target_steps > max_target) target_steps = max_target;
+
+      // Dirección alejándose de HOME (incrementa posición)
+      g_run_dir = 0;
+      Steppers_SetDir(g_run_dir);
+
+      if (g_pos_steps < target_steps)
+      {
+        // Seguimos avanzando hacia los 60mm
+        Steppers_SetStepFreq_Hz(FSTEP_HOME_HZ);
+        debug_printf("[IDLE] Offset 60mm: pos=%ld steps, target=%ld\r\n",
+                     (long)g_pos_steps, (long)target_steps);
+        break; // aún no llegamos, no pasar a RUNNING
+      }
+
+      // Llegamos (o superamos levemente) los 60mm
+      Steppers_SetStepFreq_Hz(0.0f);
+      g_offset60_done = 1;
+      // Re-centrar coordenadas: este punto pasa a ser pos=0/min=0
+      g_pos_steps = 0;
+      g_min_steps = 0;
+      g_last_limit_hit = LIMIT_NONE;
+      debug_printf("[IDLE] Offset 60mm completado. Nuevo origen pos=0 (steps=%ld)\r\n", (long)g_pos_steps);
+      // seguimos con la lógica normal para entrar a RUNNING
+    }
 
     // 3) Todo listo → arrancar RUNNING automáticamente
     Steppers_SetStepFreq_Hz(0.0f);
